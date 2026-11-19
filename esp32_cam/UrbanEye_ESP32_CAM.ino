@@ -18,8 +18,8 @@
 #include "esp_http_server.h"
 
 // =================== WI-FI CONFIGURATION ===================
-const char* ssid = "YOUR_WIFI_SSID";          // Replace with your Wi-Fi name
-const char* password = "YOUR_WIFI_PASSWORD";  // Replace with your Wi-Fi password
+const char* ssid = "PRITHVI";          // Replace with your Wi-Fi name
+const char* password = "9845605530";  // Replace with your Wi-Fi password
 // ===========================================================
 
 // AI-Thinker Camera Pin Map
@@ -134,8 +134,8 @@ void setup() {
   config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_vsync = VSYNC_GPIO_NUM;
   config.pin_href = HREF_GPIO_NUM;
-  config.pin_siod = SIOD_GPIO_NUM;
-  config.pin_sioc = SIOC_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
