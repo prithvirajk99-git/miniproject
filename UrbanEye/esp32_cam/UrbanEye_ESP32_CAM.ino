@@ -1,24 +1,21 @@
 /*
-  UrbanEye - ESP32-CAM Firmware
-  Hardware: ESP32-CAM (AI-Thinker module with OV2640 camera sensor)
-  Description: Provides high-speed MJPEG video streaming server over Wi-Fi
-               for real-time input into the UrbanEye AI Pothole Detection system.
+  UrbanEye - ESP32-CAM Firmware (Tailored for RHYX M21-45 / GC2145 & OV2640 Sensors)
+  Hardware: ESP32-CAM (AI-Thinker module with RHYX M21-45 / GC2145 or OV2640)
   
-  Flashing Instructions:
-  1. Open in Arduino IDE.
-  2. Select Board: "AI Thinker ESP32-CAM".
-  3. Ensure CPU Frequency is set to 240MHz, Flash Frequency 80MHz.
-  4. Connect GPIO 0 to GND while uploading firmware using FTDI programmer (3.3V or 5V with adequate current).
-  5. Remove GPIO 0 jumper and press Reset button to boot into streaming mode.
-  6. Open Serial Monitor at 115200 baud to view the assigned IP address.
+  Why this specialized sketch is needed:
+  The RHYX M21-45 sensor (GalaxyCore GC2145) does NOT have hardware JPEG encoding.
+  This firmware initializes the sensor in RGB565 / YUV422 and utilizes the onboard
+  ESP32 software JPEG converter (img_converters.h) to produce a high-speed MJPEG
+  stream over Wi-Fi for UrbanEye.
 */
 
 #include "esp_camera.h"
 #include <WiFi.h>
 #include "esp_http_server.h"
+#include "img_converters.h" // Software JPEG converter for RHYX M21-45 (GC2145)
 
 // =================== WI-FI CONFIGURATION ===================
-const char* ssid = "YOUR_WIFI_SSID";          // Replace with your Wi-Fi name
+const char* ssid = "YOUR_WIFI_SSID";          // Replace with your Wi-Fi name (2.4 GHz)
 const char* password = "YOUR_WIFI_PASSWORD";  // Replace with your Wi-Fi password
 // ===========================================================
 
@@ -41,7 +38,7 @@ const char* password = "YOUR_WIFI_PASSWORD";  // Replace with your Wi-Fi passwor
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// Built-in Flash LED pin
+// Flash LED pin
 #define FLASH_LED_PIN      4
 
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -56,6 +53,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   esp_err_t res = ESP_OK;
   size_t _jpg_buf_len = 0;
   uint8_t * _jpg_buf = NULL;
+  bool is_converted = false;
   char * part_buf[64];
 
   res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
@@ -66,11 +64,22 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   while(true){
     fb = esp_camera_fb_get();
     if (!fb) {
-      Serial.println("[ESP32-CAM] Camera capture failed");
+      Serial.println("[ESP32-CAM] Frame capture failed");
       res = ESP_FAIL;
     } else {
-      _jpg_buf_len = fb->len;
-      _jpg_buf = fb->buf;
+      // If hardware JPEG is available (e.g. OV2640), use directly
+      if (fb->format == PIXFORMAT_JPEG) {
+        _jpg_buf = fb->buf;
+        _jpg_buf_len = fb->len;
+        is_converted = false;
+      } else {
+        // RHYX M21-45 (GC2145) outputs RGB565/YUV422 -> convert to JPEG on the fly
+        is_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+        if (!is_converted) {
+          Serial.println("[ESP32-CAM] Software JPEG conversion failed");
+          res = ESP_FAIL;
+        }
+      }
     }
 
     if(res == ESP_OK){
@@ -83,11 +92,19 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     if(res == ESP_OK){
       res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
     }
+
+    // Clean up dynamically allocated JPEG buffer from frame2jpg
+    if (is_converted && _jpg_buf) {
+      free(_jpg_buf);
+      _jpg_buf = NULL;
+    }
+
     if(fb){
       esp_camera_fb_return(fb);
       fb = NULL;
-      _jpg_buf = NULL;
-    } else if(res != ESP_OK){
+    }
+
+    if(res != ESP_OK){
       break;
     }
   }
@@ -105,7 +122,7 @@ void startCameraServer(){
     .user_ctx  = NULL
   };
 
-  Serial.printf("[ESP32-CAM] Starting web server on port: '%d'\n", config.server_port);
+  Serial.printf("[ESP32-CAM] Starting MJPEG stream server on port: '%d'\n", config.server_port);
   if (httpd_start(&stream_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(stream_httpd, &stream_uri);
   }
@@ -115,13 +132,13 @@ void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println("\n==================================================");
-  Serial.println(" [UrbanEye] Initializing ESP32-CAM...");
+  Serial.println(" [UrbanEye] ESP32-CAM (RHYX M21-45 / GC2145 Mode)");
   Serial.println("==================================================");
 
   pinMode(FLASH_LED_PIN, OUTPUT);
   digitalWrite(FLASH_LED_PIN, LOW); // Flash LED off by default
 
-  // Hardware reset pulse to wake up OV2640 sensor from power-down
+  // Hardware reset pulse to wake up camera sensor
   pinMode(PWDN_GPIO_NUM, OUTPUT);
   digitalWrite(PWDN_GPIO_NUM, HIGH); // Power down
   delay(20);
@@ -148,33 +165,36 @@ void setup() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   
-  // Use 10MHz-16.5MHz for maximum stability on clone modules & noisy ribbon cables
+  // 10MHz clock for RHYX M21-45 stability
   config.xclk_freq_hz = 10000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-  
-  // Check PSRAM
+
+  // IMPORTANT FOR RHYX M21-45 (GC2145):
+  // RHYX M21-45 does NOT have hardware JPEG. We configure RGB565.
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size = FRAMESIZE_QVGA; // 320x240 (ideal for raw buffer and CPU conversion)
+  config.fb_count = 1;
+
   if(psramFound()){
-    Serial.println("[ESP32-CAM] PSRAM detected! Enabling VGA (640x480)");
-    config.frame_size = FRAMESIZE_VGA; // 640x480
-    config.jpeg_quality = 12;
-    config.fb_count = 2;
+    Serial.println("[ESP32-CAM] PSRAM detected!");
   } else {
-    Serial.println("[ESP32-CAM] Warning: PSRAM NOT found! Using QVGA (320x240)");
-    config.frame_size = FRAMESIZE_QVGA; // 320x240
-    config.jpeg_quality = 15;
-    config.fb_count = 1;
+    Serial.println("[ESP32-CAM] Notice: Running on internal SRAM");
   }
 
-  // Camera init
+  // First try initializing in RGB565 (for RHYX M21-45 / GC2145)
   esp_err_t err = esp_camera_init(&config);
+  
+  // If RGB565 fails, fallback to YUV422
+  if (err != ESP_OK) {
+    Serial.printf("[ESP32-CAM] RGB565 init returned 0x%x. Trying YUV422...\n", err);
+    config.pixel_format = PIXFORMAT_YUV422;
+    err = esp_camera_init(&config);
+  }
+
   if (err != ESP_OK) {
     Serial.printf("[ESP32-CAM] Camera init failed with error 0x%x\n", err);
-    Serial.println("\n[TROUBLESHOOTING TIP]");
-    Serial.println("1. Reseat the camera ribbon cable firmly into the connector.");
-    Serial.println("2. Make sure Tools -> PSRAM is set to 'Enabled' in Arduino IDE.");
     return;
   }
-  Serial.println("[ESP32-CAM] Camera sensor initialized successfully!");
+  Serial.println("[ESP32-CAM] RHYX M21-45 sensor initialized successfully!");
 
   // Connect to Wi-Fi
   WiFi.begin(ssid, password);
@@ -189,7 +209,7 @@ void setup() {
   startCameraServer();
 
   Serial.println("==================================================");
-  Serial.print("UrbanEye ESP32-CAM Stream Ready at: http://");
+  Serial.print("UrbanEye Stream Ready: http://");
   Serial.print(WiFi.localIP());
   Serial.println(":81/stream");
   Serial.println("==================================================");
