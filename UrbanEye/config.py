@@ -21,7 +21,7 @@ DEFAULT_CONFIG = {
     # Model Settings
     "model_path": os.path.join(BASE_DIR, "models", "best.pt"),
     "fallback_model_name": "yolov8n.pt",
-    "confidence_threshold": 0.50,  # 50% minimum confidence
+    "confidence_threshold": 0.35,  # 35% default (ideal for screen tests & road feeds)
     "iou_threshold": 0.45,
     
     # Target classes for pothole detection

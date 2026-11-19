@@ -23,9 +23,10 @@ __pycache__/
 venv/
 env/
 
-# Large Model Weights (YOLO)
+# Large Model Weights (allow the 22MB best.pt)
 *.pt
-!models/README.md
+!models/best.pt
+!UrbanEye/models/best.pt
 
 # Captured Output Images (Keep directory structure)
 detected_potholes/*
