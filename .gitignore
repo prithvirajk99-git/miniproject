@@ -14,10 +14,25 @@ $RECYCLE.BIN/
 *.sln
 *.sw?
 
-# Node / Python / Temp
-node_modules/
+# Python / Environments
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 .env
-dist/
-build/
+venv/
+env/
+
+# Large Model Weights (YOLO)
+*.pt
+!models/README.md
+
+# Captured Output Images (Keep directory structure)
+detected_potholes/*
+!detected_potholes/.gitkeep
+UrbanEye/detected_potholes/*
+!UrbanEye/detected_potholes/.gitkeep
+
+# Runtime config overrides
+config.json
+UrbanEye/config.json
