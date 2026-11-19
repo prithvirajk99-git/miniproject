@@ -37,3 +37,7 @@ UrbanEye/detected_potholes/*
 # Runtime config overrides
 config.json
 UrbanEye/config.json
+
+dataset/
+*.zip
+runs/

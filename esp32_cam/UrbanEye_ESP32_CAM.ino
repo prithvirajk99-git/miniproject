@@ -15,8 +15,8 @@
 #include "img_converters.h" // Software JPEG converter for RHYX M21-45 (GC2145)
 
 // =================== WI-FI CONFIGURATION ===================
-const char* ssid = "YOUR_WIFI_SSID";          // Replace with your Wi-Fi name (2.4 GHz)
-const char* password = "YOUR_WIFI_PASSWORD";  // Replace with your Wi-Fi password
+const char* ssid = "PRITHVI";          // Replace with your Wi-Fi name (2.4 GHz)
+const char* password = "9845605530";  // Replace with your Wi-Fi password
 // ===========================================================
 
 // AI-Thinker Camera Pin Map
