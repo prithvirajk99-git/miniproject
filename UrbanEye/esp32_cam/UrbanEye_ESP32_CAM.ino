@@ -114,10 +114,19 @@ void startCameraServer(){
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
-  Serial.println("\n[UrbanEye] Initializing ESP32-CAM...");
+  Serial.println("\n==================================================");
+  Serial.println(" [UrbanEye] Initializing ESP32-CAM...");
+  Serial.println("==================================================");
 
   pinMode(FLASH_LED_PIN, OUTPUT);
   digitalWrite(FLASH_LED_PIN, LOW); // Flash LED off by default
+
+  // Hardware reset pulse to wake up OV2640 sensor from power-down
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, HIGH); // Power down
+  delay(20);
+  digitalWrite(PWDN_GPIO_NUM, LOW);  // Power up
+  delay(50);
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -138,15 +147,19 @@ void setup() {
   config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  
+  // Use 10MHz-16.5MHz for maximum stability on clone modules & noisy ribbon cables
+  config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
   
-  // Use SVGA or VGA for high FPS processing
+  // Check PSRAM
   if(psramFound()){
-    config.frame_size = FRAMESIZE_VGA; // 640x480 (ideal for real-time YOLO)
-    config.jpeg_quality = 12;          // 0-63 (lower is higher quality)
+    Serial.println("[ESP32-CAM] PSRAM detected! Enabling VGA (640x480)");
+    config.frame_size = FRAMESIZE_VGA; // 640x480
+    config.jpeg_quality = 12;
     config.fb_count = 2;
   } else {
+    Serial.println("[ESP32-CAM] Warning: PSRAM NOT found! Using QVGA (320x240)");
     config.frame_size = FRAMESIZE_QVGA; // 320x240
     config.jpeg_quality = 15;
     config.fb_count = 1;
@@ -156,8 +169,12 @@ void setup() {
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("[ESP32-CAM] Camera init failed with error 0x%x\n", err);
+    Serial.println("\n[TROUBLESHOOTING TIP]");
+    Serial.println("1. Reseat the camera ribbon cable firmly into the connector.");
+    Serial.println("2. Make sure Tools -> PSRAM is set to 'Enabled' in Arduino IDE.");
     return;
   }
+  Serial.println("[ESP32-CAM] Camera sensor initialized successfully!");
 
   // Connect to Wi-Fi
   WiFi.begin(ssid, password);
