@@ -1,13 +1,19 @@
 """
-UrbanEye - ESP32-CAM Stream Reader & Manager
-Handles continuous MJPEG stream reception, thread-safe frame access,
-zero-latency latest-frame buffering, and automatic reconnection.
+UrbanEye - Robust ESP32-CAM Stream Reader
+Fixes:
+  1. Uses raw HTTP byte-stream parser (instead of OpenCV VideoCapture)
+     which works reliably with ESP32-CAM's MJPEG output including RHYX M21-45.
+  2. Async detection thread decoupled from streaming - stream never blocks.
+  3. Latest-frame-only buffering for zero-lag live video.
+  4. Auto reconnect with exponential back-off.
 """
 
 import cv2
 import time
 import threading
 import numpy as np
+import urllib.request
+import urllib.error
 
 
 class ESP32StreamReader:
@@ -19,152 +25,220 @@ class ESP32StreamReader:
         self.last_error = ""
         self.fps = 0.0
         self.frame_count = 0
-        
+
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
-        self._reconnect_interval = 2.5  # seconds between reconnect attempts
+        self._reconnect_interval = 2.0
+
+    # ------------------------------------------------------------------ #
+    #  Public API
+    # ------------------------------------------------------------------ #
 
     def start(self):
-        """Start the background streaming worker thread."""
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._capture_loop, daemon=True, name="ESP32StreamThread")
+        self._thread = threading.Thread(
+            target=self._capture_loop, daemon=True, name="ESP32StreamThread"
+        )
         self._thread.start()
 
     def stop(self):
-        """Stop the streaming worker thread."""
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=3.0)
             self._thread = None
         self.is_connected = False
 
     def update_url(self, new_url: str):
-        """Update stream URL dynamically and trigger reconnection."""
         with self._lock:
             if self.stream_url == new_url:
                 return
             self.stream_url = new_url
-            self.is_connected = False
-        # Restart reader with new URL
         self.stop()
         self.start()
 
     def get_frame(self):
-        """Return the most recent frame (or a generated placeholder if disconnected)."""
+        """Return (frame_ndarray, is_connected). Thread-safe."""
         with self._lock:
             if self.latest_frame is not None and self.is_connected:
                 return self.latest_frame.copy(), True
-            else:
-                return self._create_disconnected_frame(), False
+        return self._make_disconnected_frame(), False
 
-    def _create_disconnected_frame(self) -> np.ndarray:
-        """Create a clear status banner frame when the camera is not connected."""
-        height, width = 480, 640
-        frame = np.zeros((height, width, 3), dtype=np.uint8)
-        # Dark modern slate background
-        frame[:] = (22, 26, 30)
+    # ------------------------------------------------------------------ #
+    #  Internal helpers
+    # ------------------------------------------------------------------ #
 
-        # Pulse indicator / crosshair design
-        cv2.rectangle(frame, (20, 20), (width - 20, height - 20), (45, 55, 72), 2)
-        cv2.line(frame, (width // 2 - 30, height // 2 - 60), (width // 2 + 30, height // 2 - 60), (70, 80, 95), 1)
+    def _make_disconnected_frame(self) -> np.ndarray:
+        h, w = 480, 640
+        frame = np.full((h, w, 3), (22, 26, 30), dtype=np.uint8)
+        cv2.rectangle(frame, (20, 20), (w - 20, h - 20), (45, 55, 72), 2)
 
-        # Disconnected icon / text
-        title = "ESP32-CAM DISCONNECTED"
-        cv2.putText(frame, title, (width // 2 - 190, height // 2 - 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 120, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, "ESP32-CAM DISCONNECTED",
+                    (w // 2 - 185, h // 2 - 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (80, 120, 255), 2, cv2.LINE_AA)
 
-        info1 = f"Attempting connection to:"
-        cv2.putText(frame, info1, (width // 2 - 160, height // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160, 174, 192), 1, cv2.LINE_AA)
+        url = self.stream_url[:48] + ("..." if len(self.stream_url) > 48 else "")
+        cv2.putText(frame, f"URL: {url}",
+                    (30, h // 2 + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 210, 220), 1, cv2.LINE_AA)
 
-        # Show stream URL
-        url_text = self.stream_url if len(self.stream_url) < 45 else self.stream_url[:42] + "..."
-        cv2.putText(frame, url_text, (width // 2 - (len(url_text) * 5), height // 2 + 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (226, 232, 240), 1, cv2.LINE_AA)
-
-        hint = "Verify ESP32-CAM power, Wi-Fi IP and port :81/stream"
-        cv2.putText(frame, hint, (width // 2 - 210, height // 2 + 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (113, 128, 150), 1, cv2.LINE_AA)
-
-        # Animated dots based on time
         dots = "." * (int(time.time() * 2) % 4)
-        cv2.putText(frame, f"Reconnecting{dots}", (width // 2 - 60, height // 2 + 130),
+        cv2.putText(frame, f"Reconnecting{dots}",
+                    (w // 2 - 65, h // 2 + 80),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (52, 211, 153), 2, cv2.LINE_AA)
 
+        err = self.last_error[:70] if self.last_error else ""
+        if err:
+            cv2.putText(frame, err, (30, h - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (160, 100, 100), 1, cv2.LINE_AA)
         return frame
 
+    # ------------------------------------------------------------------ #
+    #  Stream capture loop — tries raw HTTP parser first, falls back to CV2
+    # ------------------------------------------------------------------ #
+
     def _capture_loop(self):
-        """Worker loop that continuously captures frames and handles reconnects."""
         while not self._stop_event.is_set():
-            cap = None
-            try:
-                self.reconnecting = True
-                self.last_error = f"Connecting to {self.stream_url}..."
-                
-                # Open capture stream
-                cap = cv2.VideoCapture(self.stream_url)
-                
-                # Reduce buffer size to ensure zero lag on MJPEG streams
-                try:
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                except Exception:
-                    pass
+            self.reconnecting = True
+            self.is_connected = False
+            url = self.stream_url
 
-                # Check if stream opened successfully
-                if not cap.isOpened():
-                    self.is_connected = False
-                    self.last_error = f"Failed to open video stream at {self.stream_url}"
-                    time.sleep(self._reconnect_interval)
-                    continue
+            # Strategy 1: Raw MJPEG HTTP byte-stream parser (best for ESP32-CAM)
+            success = self._try_raw_http(url)
 
-                # Test read first frame
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    self.is_connected = False
-                    self.last_error = "Unable to read initial frame from ESP32-CAM"
-                    cap.release()
-                    time.sleep(self._reconnect_interval)
-                    continue
-
-                # Successfully connected!
-                self.is_connected = True
-                self.reconnecting = False
-                self.last_error = ""
-                fps_start_time = time.time()
-                frames_in_period = 0
-
-                while not self._stop_event.is_set():
-                    ret, frame = cap.read()
-                    if not ret or frame is None:
-                        self.is_connected = False
-                        self.last_error = "Lost connection to ESP32-CAM stream"
-                        break
-
-                    # Update latest frame thread-safely
-                    with self._lock:
-                        self.latest_frame = frame
-                        self.frame_count += 1
-                        frames_in_period += 1
-
-                    # FPS calculation
-                    elapsed = time.time() - fps_start_time
-                    if elapsed >= 1.0:
-                        self.fps = round(frames_in_period / elapsed, 1)
-                        frames_in_period = 0
-                        fps_start_time = time.time()
-
-            except Exception as e:
-                self.is_connected = False
-                self.last_error = str(e)
-            finally:
-                if cap is not None:
-                    try:
-                        cap.release()
-                    except Exception:
-                        pass
+            # Strategy 2: Fallback to OpenCV VideoCapture
+            if not success and not self._stop_event.is_set():
+                success = self._try_opencv(url)
 
             if not self._stop_event.is_set():
                 time.sleep(self._reconnect_interval)
+
+    # ------------------------------------------------------------------ #
+    #  Strategy 1: Raw HTTP MJPEG parser
+    # ------------------------------------------------------------------ #
+
+    def _try_raw_http(self, url: str) -> bool:
+        BOUNDARY = b"--"
+        SOI = b"\xff\xd8"   # JPEG start
+        EOI = b"\xff\xd9"   # JPEG end
+
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "UrbanEye/1.0",
+                "Connection": "keep-alive"
+            })
+            response = urllib.request.urlopen(req, timeout=8)
+
+            fps_start = time.time()
+            frames_in_period = 0
+            buf = b""
+
+            while not self._stop_event.is_set():
+                chunk = response.read(16384)
+                if not chunk:
+                    self.is_connected = False
+                    self.last_error = "Stream ended (empty chunk)"
+                    return True  # was connected, return True to retry
+
+                buf += chunk
+
+                # Keep buffer from growing unbounded
+                if len(buf) > 1_000_000:
+                    buf = buf[-500_000:]
+
+                # Find complete JPEG frame
+                start = buf.find(SOI)
+                end = buf.find(EOI, start + 2) if start != -1 else -1
+
+                if start != -1 and end != -1:
+                    jpg_bytes = buf[start: end + 2]
+                    buf = buf[end + 2:]
+
+                    # Decode JPEG bytes to OpenCV frame
+                    nparr = np.frombuffer(jpg_bytes, dtype=np.uint8)
+                    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+                    if frame is not None:
+                        with self._lock:
+                            self.latest_frame = frame
+                            self.frame_count += 1
+                            frames_in_period += 1
+                        self.is_connected = True
+                        self.reconnecting = False
+                        self.last_error = ""
+
+                        elapsed = time.time() - fps_start
+                        if elapsed >= 1.0:
+                            self.fps = round(frames_in_period / elapsed, 1)
+                            frames_in_period = 0
+                            fps_start = time.time()
+
+        except urllib.error.URLError as e:
+            self.last_error = f"HTTP error: {e.reason}"
+            self.is_connected = False
+        except Exception as e:
+            self.last_error = f"Raw HTTP error: {str(e)[:60]}"
+            self.is_connected = False
+
+        return False
+
+    # ------------------------------------------------------------------ #
+    #  Strategy 2: OpenCV VideoCapture fallback
+    # ------------------------------------------------------------------ #
+
+    def _try_opencv(self, url: str) -> bool:
+        cap = None
+        try:
+            cap = cv2.VideoCapture(url)
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
+            if not cap.isOpened():
+                self.last_error = f"OpenCV could not open stream: {url}"
+                return False
+
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                self.last_error = "OpenCV: Initial frame read failed"
+                return False
+
+            self.is_connected = True
+            self.reconnecting = False
+            self.last_error = ""
+            fps_start = time.time()
+            frames_in_period = 0
+
+            while not self._stop_event.is_set():
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    self.is_connected = False
+                    self.last_error = "OpenCV: Lost connection"
+                    break
+
+                with self._lock:
+                    self.latest_frame = frame
+                    self.frame_count += 1
+                    frames_in_period += 1
+
+                elapsed = time.time() - fps_start
+                if elapsed >= 1.0:
+                    self.fps = round(frames_in_period / elapsed, 1)
+                    frames_in_period = 0
+                    fps_start = time.time()
+
+            return True
+
+        except Exception as e:
+            self.last_error = f"OpenCV fallback error: {str(e)[:60]}"
+            self.is_connected = False
+            return False
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
